@@ -2,7 +2,7 @@
 
 use crate::legendary::hidden_command;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::os::windows::io::AsRawHandle;
@@ -20,12 +20,18 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// bootstrapper, launcher y cliente, y entre uno y otro puede no haber ninguno.
 const MISSES_TO_EXIT: u32 = 3;
 
+/// Si otro hilo falló con el candado tomado, el dato sigue siendo útil: se recupera
+/// en vez de propagar el fallo a todo el launcher.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Juegos que el usuario acaba de cerrar: su vigilante no tiene que esperar más.
 static CLOSED_BY_USER: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 fn take_closed_by_user(root: &Path) -> bool {
     let root = normalize(root);
-    let mut closed = CLOSED_BY_USER.lock().unwrap();
+    let mut closed = lock(&CLOSED_BY_USER);
     let was_closed = closed.contains(&root);
     closed.retain(|path| *path != root);
     was_closed
@@ -139,7 +145,7 @@ pub fn kill_game(root: &Path) {
         }
         sleep(Duration::from_millis(300));
     }
-    CLOSED_BY_USER.lock().unwrap().push(normalize(root));
+    lock(&CLOSED_BY_USER).push(normalize(root));
 }
 
 /// Carpetas que nunca se pueden borrar, ni ellas ni ninguna que las contenga.
@@ -158,21 +164,106 @@ pub fn remove_leftover_folder(root: &Path) -> bool {
     is_safe_root(root) && !holds_protected_folder(root) && std::fs::remove_dir_all(root).is_ok()
 }
 
-/// Cierra los demás procesos de este mismo ejecutable, como el de segundo plano.
-pub fn kill_other_instances() {
-    let Ok(own_exe) = std::env::current_exe() else {
-        return;
-    };
+/// Cierra los procesos de ese ejecutable, salvo este mismo.
+pub fn kill_exe(path: &Path) {
     let mut system = System::new();
     refresh(&mut system);
-    let own_exe = normalize(&own_exe);
+    let target = normalize(path);
     let own_pid = sysinfo::get_current_pid().ok();
     for (pid, process) in system.processes() {
-        let same_exe = process.exe().is_some_and(|exe| normalize(exe) == own_exe);
+        let same_exe = process.exe().is_some_and(|exe| normalize(exe) == target);
         if same_exe && Some(*pid) != own_pid {
             kill_tree(pid.as_u32());
         }
     }
+}
+
+pub fn is_elevated() -> bool {
+    // SAFETY: función sin argumentos de shell32.
+    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+}
+
+/// Abre un programa como lo haría el Explorador. Con `elevated`, Windows pide permiso
+/// de administrador; también lo pide solo si el programa lo exige.
+pub fn shell_open(program: &Path, arguments: &str, elevated: bool) -> bool {
+    let verb = wide(if elevated { "runas" } else { "open" });
+    let file = wide(&program.display().to_string());
+    let params = wide(arguments);
+    // SAFETY: todas las cadenas terminan en cero y viven durante la llamada.
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW devuelve un valor mayor que 32 si funcionó.
+    result as usize > 32
+}
+
+/// ¿Se puede escribir en `dir` sin ser administrador? Se prueba en la carpeta o, si no
+/// existe aún, en el primer antecesor que sí exista.
+pub fn can_write(dir: &Path) -> bool {
+    let mut existing = dir;
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return false,
+        }
+    }
+    let probe = existing.join(format!("rb_write_test_{}.tmp", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Las operaciones sobre `dir` necesitan administrador: ni lo somos ni se puede escribir.
+pub fn needs_elevation(dir: &Path) -> bool {
+    !is_elevated() && !can_write(dir)
+}
+
+/// Lanza un programa con `runas` (pide administrador) y espera a que termine.
+/// Devuelve su código de salida, o `None` si el usuario no concedió el permiso.
+pub fn shell_execute_wait(file: &Path, parameters: &str) -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+
+    let verb = wide("runas");
+    let file_w = wide(&file.display().to_string());
+    let params_w = wide(parameters);
+    // SAFETY: SHELLEXECUTEINFOW admite ceros; los punteros viven durante la llamada.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file_w.as_ptr();
+    info.lpParameters = params_w.as_ptr();
+    info.nShow = windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // SAFETY: `info` está relleno; se comprueba el handle antes de usarlo.
+    let launched = unsafe { ShellExecuteExW(&mut info) != 0 } && !info.hProcess.is_null();
+    if !launched {
+        return None;
+    }
+    // SAFETY: `hProcess` es válido hasta que lo cerramos aquí.
+    let exit = unsafe {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code: u32 = 1;
+        if WaitForSingleObject(info.hProcess, 0) == WAIT_OBJECT_0 {
+            GetExitCodeProcess(info.hProcess, &mut code);
+        }
+        CloseHandle(info.hProcess);
+        code
+    };
+    Some(exit)
 }
 
 fn wide(text: &str) -> Vec<u16> {

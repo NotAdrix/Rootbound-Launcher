@@ -192,12 +192,15 @@ pub fn render_section(app: &mut LauncherApp, ui: &mut egui::Ui, section: Section
     let games = std::mem::take(&mut app.games);
     let mut to_remove = None;
     {
-        let visible = logica::visible_games(&games, section, &app.search, app.config.sort_order);
-        if visible.is_empty() {
+        let indices = app
+            .visible
+            .get(&games, app.library_version, section, &app.search, app.config.sort_order)
+            .to_vec();
+        if indices.is_empty() {
             ui.label(RichText::new(app.t("no_results")).color(Color32::GRAY));
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for game in visible {
+            for game in indices.iter().filter_map(|index| games.get(*index)) {
                 card(8.0, 10.0).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     game_card(app, ui, game, &mut to_remove);
@@ -225,8 +228,23 @@ fn page_header(app: &mut LauncherApp, ui: &mut egui::Ui, key: &str) {
     ui.add_space(15.0);
 }
 
+fn tracking_toggle(app: &mut LauncherApp, ui: &mut egui::Ui) {
+    let key = if app.config.tracking_disabled { "enable_tracking" } else { "disable_tracking" };
+    let fill = if app.config.tracking_disabled { DARK_CYAN } else { Color32::from_rgb(60, 60, 68) };
+    if filled_button(ui, app.t(key), fill) {
+        app.config.tracking_disabled = !app.config.tracking_disabled;
+        app.save_config();
+        app.sync_background();
+    }
+    if app.config.tracking_disabled {
+        ui.label(RichText::new(app.t("tracking_off_note")).color(Color32::GRAY));
+    }
+    ui.add_space(10.0);
+}
+
 pub fn render_stats(app: &mut LauncherApp, ui: &mut egui::Ui) {
     page_header(app, ui, "stats");
+    tracking_toggle(app, ui);
     let mut entries: Vec<(u64, &GameInfo)> = app
         .games
         .iter()
@@ -392,6 +410,7 @@ fn game_card(app: &mut LauncherApp, ui: &mut egui::Ui, game: &GameInfo, to_remov
                             app.config.auto_update.remove(&game.app_name);
                         }
                         app.save_config();
+                        app.sync_background();
                     }
                 }
             }
@@ -406,7 +425,7 @@ fn game_card(app: &mut LauncherApp, ui: &mut egui::Ui, game: &GameInfo, to_remov
             } else if action_button(ui, app.t("install"), Color32::from_rgb(40, 40, 45)) {
                 app.install_dialog = Some(InstallDialog {
                     game: game.clone(),
-                    path: default_install_path(),
+                    path: default_install_path(app),
                     dlcs: true,
                     language: AUTO_LANGUAGE.to_string(),
                 });
@@ -490,10 +509,12 @@ fn epic_options(app: &mut LauncherApp, ui: &mut egui::Ui, game: &GameInfo) {
     }
 }
 
-fn default_install_path() -> String {
-    dirs::data_dir()
-        .map(|dir| dir.join("Legendary").to_string_lossy().into_owned())
-        .unwrap_or_else(|| r"C:\Legendary".to_string())
+/// La última carpeta usada o, la primera vez, `C:\Rootbound\Games`.
+fn default_install_path(app: &LauncherApp) -> String {
+    app.config
+        .last_install_dir
+        .clone()
+        .unwrap_or_else(|| crate::paths::games_dir().to_string_lossy().into_owned())
 }
 
 pub fn render_dialogs(app: &mut LauncherApp, ctx: &egui::Context) {
@@ -542,6 +563,8 @@ fn render_install(app: &mut LauncherApp, ctx: &egui::Context) {
 
     if start {
         app.set_game_language(&dialog.game.app_name, &dialog.language);
+        app.config.last_install_dir = Some(dialog.path.clone());
+        app.save_config();
         app.installing = Some(dialog.game.app_name.clone());
         app.send(UiCommand::InstallGame {
             app_name: dialog.game.app_name,

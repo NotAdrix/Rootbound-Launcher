@@ -231,8 +231,7 @@ fn bitlocker_is_active() -> bool {
 }
 
 fn work_dir() -> Result<PathBuf, DriversFailure> {
-    let base = std::env::var_os("ProgramData").ok_or(DriversFailure::Prepare)?;
-    let dir = PathBuf::from(base).join("RootboundLauncher").join("drivers");
+    let dir = crate::paths::drivers_dir();
     std::fs::create_dir_all(&dir).map_err(|_| DriversFailure::Prepare)?;
     Ok(dir)
 }
@@ -405,20 +404,57 @@ pub fn open_nvcleanstall(events: &Events) {
             events.log(LogMsg::NvcleanstallDownloading);
             download_nvcleanstall(&path)?;
         }
-        std::process::Command::new(&path)
-            .spawn()
-            .map(drop)
-            .map_err(|_| DriversFailure::Install)
+        // El instalador pide administrador: así Windows muestra el aviso en vez de fallar.
+        crate::process::shell_open(&path, "", false)
+            .then_some(())
+            .ok_or(DriversFailure::Install)
     });
     if let Err(failure) = opened {
         events.log(LogMsg::DriversFailed(failure));
     }
 }
 
+pub const ELEVATED_FLAG: &str = "--clean-drivers";
+
+/// Cambiar el arranque necesita administrador: se pide solo para esto, relanzando el
+/// launcher con permisos. Si ya los tiene, se hace directamente.
 pub fn clean_drivers(events: &Events) {
+    if crate::process::is_elevated() {
+        let config = config::load();
+        if let Err(failure) = prepare_and_schedule(config.language, config.use_nvcleanstall, events) {
+            events.log(LogMsg::DriversFailed(failure));
+        }
+        return;
+    }
+    events.log(LogMsg::DriversElevating);
+    let launched = std::env::current_exe()
+        .is_ok_and(|exe| crate::process::shell_open(&exe, ELEVATED_FLAG, true));
+    if !launched {
+        events.log(LogMsg::DriversFailed(DriversFailure::Cancelled));
+    }
+}
+
+/// Proceso con permisos de administrador y sin interfaz: si falla, avisa con un mensaje.
+pub fn clean_drivers_elevated() {
     let config = config::load();
-    if let Err(failure) = prepare_and_schedule(config.language, config.use_nvcleanstall, events) {
-        events.log(LogMsg::DriversFailed(failure));
+    let result = prepare_and_schedule(config.language, config.use_nvcleanstall, &Events::detached());
+    if let Err(failure) = result {
+        let text = crate::i18n::render_log(config.language, &LogMsg::DriversFailed(failure));
+        show_message(&text);
+    }
+}
+
+fn show_message(text: &str) {
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "Rootbound Launcher".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: ambas cadenas terminan en cero y viven durante la llamada.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+        );
     }
 }
 

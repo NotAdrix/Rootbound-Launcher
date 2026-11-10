@@ -150,6 +150,8 @@ fn replace_running_exe(url: &str, events: &Events) -> Result<()> {
         let _ = std::fs::rename(&old_exe, &exe);
         return Err(e.into());
     }
+    // RootboundBackground es una copia del mismo ejecutable.
+    let _ = std::fs::copy(&exe, crate::paths::background_exe());
     Command::new(&exe).spawn()?;
     Ok(())
 }
@@ -166,9 +168,13 @@ fn schedule_deletion(path: &Path, delay_seconds: u32) -> std::io::Result<()> {
         .map(drop)
 }
 
+pub fn delete_file_after_exit(path: &Path) {
+    let _ = schedule_deletion(path, 8);
+}
+
 pub fn delete_own_exe_after_exit() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = schedule_deletion(&exe, 8);
+        delete_file_after_exit(&exe);
     }
 }
 

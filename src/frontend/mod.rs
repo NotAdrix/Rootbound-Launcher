@@ -12,6 +12,7 @@ use eframe::egui::{self, Color32, FontFamily, FontId, RichText, TextStyle};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_LOG_LINES: usize = 500;
@@ -59,6 +60,8 @@ pub struct LauncherApp {
     pub(crate) view: View,
     pub(crate) epic_games: Vec<GameInfo>,
     pub(crate) games: Vec<GameInfo>,
+    pub(crate) library_version: u64,
+    pub(crate) visible: logica::VisibleCache,
     pub(crate) running_game: Option<String>,
     pub(crate) search: String,
     pub(crate) art: HashMap<String, egui::TextureHandle>,
@@ -66,6 +69,9 @@ pub struct LauncherApp {
     tx_cmd: Sender<UiCommand>,
     rx_evt: Receiver<BackendEvent>,
     logs: VecDeque<LogMsg>,
+    /// Texto ya traducido de cada línea: se genera al llegar, no en cada fotograma.
+    log_text: VecDeque<String>,
+    log_language: crate::types::Language,
     pub(crate) show_terminal: bool,
     progress: Option<Progress>,
     pub(crate) is_paused: bool,
@@ -85,6 +91,8 @@ pub struct LauncherApp {
     pub(crate) installing: Option<String>,
     pub(crate) ask_remove_browser: bool,
     pub(crate) has_nvidia: bool,
+    tray: Option<Arc<crate::tray::TrayState>>,
+    quitting: bool,
     pub(crate) ghost_games: VecDeque<(String, String)>,
     pub(crate) playtime: HashMap<String, u64>,
     pub(crate) profile: Option<Profile>,
@@ -251,18 +259,23 @@ impl LauncherApp {
         ctx.tessellation_options_mut(|options| options.feathering_size_in_pixels = 0.7);
         install_fonts(ctx);
         apply_theme(ctx);
+        let language = config.language;
 
         let mut app = Self {
             view: View::Library(config.last_section),
             epic_games: logica::load_cached_library(),
             games: Vec::new(),
+            library_version: 0,
+            visible: logica::VisibleCache::default(),
             running_game: None,
             search: String::new(),
             art: HashMap::new(),
             art_requested: HashSet::new(),
             tx_cmd,
             rx_evt,
-            logs: VecDeque::from([LogMsg::Welcome]),
+            logs: VecDeque::new(),
+            log_text: VecDeque::new(),
+            log_language: config.language,
             show_terminal: !config.terminal_hidden,
             progress: None,
             is_paused: false,
@@ -282,6 +295,8 @@ impl LauncherApp {
             installing: None,
             ask_remove_browser: false,
             has_nvidia: crate::drivers::has_nvidia_gpu(),
+            tray: Some(crate::tray::spawn(ctx.clone(), language)),
+            quitting: false,
             ghost_games: VecDeque::new(),
             playtime: logica::load_playtime(),
             profile: None,
@@ -289,6 +304,7 @@ impl LauncherApp {
             has_auto_launched: false,
             update_status: None,
         };
+        app.push_log(LogMsg::Welcome);
         // Los juegos externos no dependen del login de Epic: se ven desde el primer frame.
         app.rebuild_library();
         app
@@ -320,8 +336,22 @@ impl LauncherApp {
         }
         if self.logs.len() == MAX_LOG_LINES {
             self.logs.pop_front();
+            self.log_text.pop_front();
         }
+        self.log_text.push_back(i18n::render_log(self.log_language, &msg));
         self.logs.push_back(msg);
+    }
+
+    fn refresh_log_language(&mut self) {
+        if self.log_language != self.config.language {
+            self.log_language = self.config.language;
+            self.log_text = self.logs.iter().map(|msg| i18n::render_log(self.log_language, msg)).collect();
+        }
+    }
+
+    /// Activa o detiene RootboundBackground según los ajustes recién guardados.
+    pub(crate) fn sync_background(&self) {
+        std::thread::spawn(crate::service::sync);
     }
 
     pub(crate) fn save_config(&self) {
@@ -404,7 +434,7 @@ impl LauncherApp {
         }
     }
 
-    fn show_reset_finished(&self, ctx: &egui::Context, finished_at: Instant) {
+    fn show_reset_finished(&mut self, ctx: &egui::Context, finished_at: Instant) {
         modals::centered(self.t("reset_complete")).show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(15.0);
@@ -417,6 +447,7 @@ impl LauncherApp {
             });
         });
         if finished_at.elapsed() > Duration::from_millis(2500) {
+            self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -510,14 +541,13 @@ impl LauncherApp {
             .stick_to_bottom(true)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
-                for msg in &self.logs {
+                for (msg, text) in self.logs.iter().zip(&self.log_text) {
                     if *msg == LogMsg::Separator {
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(4.0);
                         continue;
                     }
-                    let text = i18n::render_log(self.config.language, msg);
                     ui.add(
                         egui::Label::new(RichText::new(text).monospace().color(Color32::LIGHT_GRAY))
                             .wrap(true),
@@ -568,6 +598,28 @@ impl LauncherApp {
     }
 }
 
+impl LauncherApp {
+    /// La X oculta la ventana y deja el launcher en la bandeja; solo se cierra de verdad
+    /// desde "Cerrar" en la bandeja, el reinicio de fábrica o "Eliminar App".
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        if self.tray.as_ref().is_some_and(|tray| tray.should_quit()) {
+            self.quitting = true;
+        }
+        if self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        if self.tray.as_ref().is_some_and(|tray| tray.take_show()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+}
+
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(tex) = &self.bg_texture {
@@ -579,6 +631,8 @@ impl eframe::App for LauncherApp {
             );
         }
 
+        self.handle_tray(ctx);
+        self.refresh_log_language();
         while let Ok(event) = self.rx_evt.try_recv() {
             self.handle_event(ctx, event);
         }

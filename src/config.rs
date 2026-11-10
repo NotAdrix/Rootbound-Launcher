@@ -15,13 +15,17 @@ pub struct Config {
     pub auto_update: HashSet<String>,
     pub offline_mode: bool,
     pub use_nvcleanstall: bool,
+    /// "Deshabilitar trackeo" en Estadísticas.
+    pub tracking_disabled: bool,
+    /// Carpeta de la última instalación, que se propone en la siguiente.
+    pub last_install_dir: Option<String>,
     pub terminal_hidden: bool,
     pub sort_order: SortOrder,
     pub last_section: Section,
 }
 
 pub fn dir() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("rootbound_launcher"))
+    Some(crate::paths::config_dir())
 }
 
 pub fn load() -> Config {
