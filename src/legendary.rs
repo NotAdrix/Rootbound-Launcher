@@ -31,12 +31,8 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 /// Carpeta donde el launcher guarda su propia copia de legendary.
-pub fn install_dir() -> Option<PathBuf> {
-    Some(dirs::data_local_dir()?.join("rootbound_launcher"))
-}
-
 fn ensure_installed(events: &Events) -> Result<PathBuf> {
-    let dir = install_dir().context("No se encontró la carpeta de datos del usuario.")?;
+    let dir = crate::paths::root();
     let exe = dir.join("legendary.exe");
     let _ = std::fs::remove_file(exe.with_extension("old.exe"));
     if !exe.exists() {
@@ -131,6 +127,8 @@ pub struct Legendary {
     shutting_down: Arc<AtomicBool>,
     offline: Arc<AtomicBool>,
     job: Arc<Option<KillOnExitJob>>,
+    /// Juegos con actualización pendiente, para no consultarlo antes de cada lanzamiento.
+    pending_updates: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl Legendary {
@@ -141,11 +139,14 @@ impl Legendary {
             shutting_down: Arc::default(),
             offline: Arc::new(AtomicBool::new(crate::config::load().offline_mode)),
             job: Arc::new(KillOnExitJob::new()),
+            pending_updates: Arc::default(),
         })
     }
 
     fn command(&self) -> Command {
-        hidden_command(&self.exe)
+        let mut command = hidden_command(&self.exe);
+        command.env("LEGENDARY_CONFIG_PATH", crate::paths::legendary_data());
+        command
     }
 
     fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> Option<T> {
@@ -277,7 +278,27 @@ impl Legendary {
     /// Hay que comprobarlo antes de `update`: aunque la versión sea la misma, ese comando
     /// descarga los archivos que falten, y Fortnite no guarda en disco todo su contenido.
     pub fn has_update(&self, app_name: &str) -> bool {
-        !self.is_offline() && self.games_with_updates().iter().any(|game| game == app_name)
+        !self.is_offline() && self.pending_updates().iter().any(|game| game == app_name)
+    }
+
+    /// Resultado de la última consulta; solo pregunta a Epic si aún no hay ninguno.
+    pub fn pending_updates(&self) -> Vec<String> {
+        if let Some(pending) = crate::process::lock(&self.pending_updates).clone() {
+            return pending;
+        }
+        self.refresh_pending_updates()
+    }
+
+    pub fn refresh_pending_updates(&self) -> Vec<String> {
+        let pending = self.games_with_updates();
+        *crate::process::lock(&self.pending_updates) = Some(pending.clone());
+        pending
+    }
+
+    pub fn forget_update(&self, app_name: &str) {
+        if let Some(pending) = crate::process::lock(&self.pending_updates).as_mut() {
+            pending.retain(|game| game != app_name);
+        }
     }
 
     pub fn version(&self) -> Option<String> {
@@ -383,6 +404,61 @@ impl Legendary {
         self.run_streamed(args, events, false);
     }
 
+    /// Ejecuta el comando elevándolo si `target` está en una carpeta protegida (p. ej.
+    /// `C:\Program Files`). Si no, se ejecuta normal, con pausa y progreso en directo.
+    pub fn run_in(&self, args: &[String], target: Option<&Path>, events: &Events) -> bool {
+        if target.is_some_and(crate::process::needs_elevation) {
+            self.run_elevated(args, events)
+        } else {
+            self.run(args, events)
+        }
+    }
+
+    /// Relanza legendary con permisos de administrador. Una sola petición de UAC por
+    /// operación; su salida se sigue mostrando en el terminal.
+    fn run_elevated(&self, args: &[String], events: &Events) -> bool {
+        let work = crate::paths::config_dir();
+        let _ = std::fs::create_dir_all(&work);
+        let log = work.join("elevated.log");
+        let script = work.join("elevated.cmd");
+        let _ = std::fs::remove_file(&log);
+
+        let arguments = args.iter().map(|arg| quote_arg(arg)).collect::<Vec<_>>().join(" ");
+        let content = format!(
+            "@echo off\r\nchcp 65001 >nul\r\n\
+             set \"LEGENDARY_CONFIG_PATH={cfg}\"\r\n\
+             set \"PYTHONUNBUFFERED=1\"\r\nset \"PYTHONIOENCODING=utf-8\"\r\n\
+             {exe} {arguments} > {log} 2>&1\r\n",
+            cfg = crate::paths::legendary_data().display(),
+            exe = quote_arg(&self.exe.display().to_string()),
+            log = quote_arg(&log.display().to_string()),
+        );
+        if std::fs::write(&script, content).is_err() {
+            events.log(LogMsg::CommandCouldNotStart);
+            return true;
+        }
+
+        events.log(LogMsg::ElevatingGame);
+        let done = Arc::new(AtomicBool::new(false));
+        let tail = {
+            let (done, events, log) = (done.clone(), events.clone(), log.clone());
+            thread::spawn(move || tail_log(&log, &done, &events))
+        };
+        let params = format!("/c {}", quote_arg(&script.display().to_string()));
+        let exit = crate::process::shell_execute_wait(Path::new("cmd.exe"), &params);
+        done.store(true, Ordering::SeqCst);
+        let _ = tail.join();
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&log);
+
+        match exit {
+            Some(0) => {}
+            Some(_) => events.log(LogMsg::CommandFailed),
+            None => events.log(LogMsg::ElevationDenied),
+        }
+        true
+    }
+
     fn run_streamed(&self, args: &[String], events: &Events, track: bool) -> bool {
         let spawned = self
             .command()
@@ -401,7 +477,7 @@ impl Legendary {
             if let Some(job) = self.job.as_ref() {
                 job.assign(&child);
             }
-            *self.tracked.lock().unwrap() = Some(Tracked {
+            *crate::process::lock(&self.tracked) = Some(Tracked {
                 pid: child.id(),
                 args: args.to_vec(),
             });
@@ -415,7 +491,7 @@ impl Legendary {
         let succeeded = child.wait().is_ok_and(|status| status.success());
 
         // `stop` vacía la ranura: si ya no está, nos han detenido.
-        let completed = !track || self.tracked.lock().unwrap().take().is_some();
+        let completed = !track || crate::process::lock(&self.tracked).take().is_some();
         if completed && !succeeded {
             events.log(LogMsg::CommandFailed);
         }
@@ -423,13 +499,13 @@ impl Legendary {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.tracked.lock().unwrap().is_some()
+        crate::process::lock(&self.tracked).is_some()
     }
 
     /// Mata el proceso en curso con todo su árbol y devuelve sus argumentos para
     /// poder relanzarlo: legendary retoma las descargas desde su fichero de resume.
     pub fn stop(&self) -> Option<Vec<String>> {
-        let tracked = self.tracked.lock().unwrap().take()?;
+        let tracked = crate::process::lock(&self.tracked).take()?;
         crate::process::kill_tree(tracked.pid);
         Some(tracked.args)
     }
@@ -445,14 +521,9 @@ impl Legendary {
 }
 
 /// Misma ubicación que usa legendary para sus datos.
+/// Los datos de legendary también viven en `C:\Rootbound`.
 fn data_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("LEGENDARY_CONFIG_PATH") {
-        return Some(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(path).join("legendary"));
-    }
-    Some(dirs::home_dir()?.join(".config").join("legendary"))
+    Some(crate::paths::legendary_data())
 }
 
 fn read_installed_file(path: &Path) -> Option<Vec<InstalledGame>> {
@@ -470,17 +541,58 @@ fn report_line(line: &str, events: &Events) {
     }
 }
 
+fn consume_line(line: &str, progress: &mut Progress, events: &Events) {
+    if progress.apply(line) {
+        events.send(BackendEvent::Progress(progress.clone()));
+    } else {
+        report_line(line, events);
+    }
+}
+
 fn forward_output(pipe: impl Read + Send + 'static, events: Events) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut progress = Progress::default();
-        for_each_line(pipe, |line| {
-            if progress.apply(line) {
-                events.send(BackendEvent::Progress(progress.clone()));
-            } else {
-                report_line(line, &events);
-            }
-        });
+        for_each_line(pipe, |line| consume_line(line, &mut progress, &events));
     })
+}
+
+/// Un proceso elevado no comparte tuberías con este: su salida se vuelca a un archivo
+/// y aquí se va leyendo mientras crece, hasta que `done` indica que terminó.
+fn tail_log(path: &Path, done: &AtomicBool, events: &Events) {
+    use std::io::{Seek, SeekFrom};
+    let mut progress = Progress::default();
+    let mut position = 0u64;
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let finished = done.load(Ordering::SeqCst);
+        if let Ok(mut file) = std::fs::File::open(path) {
+            if file.seek(SeekFrom::Start(position)).is_ok() {
+                let mut buf = Vec::new();
+                if let Ok(read) = file.read_to_end(&mut buf) {
+                    position += read as u64;
+                    for byte in buf {
+                        if byte == b'\n' || byte == b'\r' {
+                            consume_line(&String::from_utf8_lossy(&pending), &mut progress, events);
+                            pending.clear();
+                        } else {
+                            pending.push(byte);
+                        }
+                    }
+                }
+            }
+        }
+        if finished {
+            if !pending.is_empty() {
+                consume_line(&String::from_utf8_lossy(&pending), &mut progress, events);
+            }
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn quote_arg(arg: &str) -> String {
+    format!("\"{}\"", arg.replace('"', "\"\""))
 }
 
 /// Parte por `\n` y también por `\r`, que es como `verify` reescribe su progreso.

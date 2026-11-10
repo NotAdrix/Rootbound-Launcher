@@ -3,7 +3,7 @@
 
 use crate::frontend::LauncherApp;
 use crate::config;
-use crate::legendary::{self, hidden_command, Legendary};
+use crate::legendary::{hidden_command, Legendary};
 use crate::process::{self, ProcessSnapshot};
 use crate::types::{BackendEvent, Events, LogMsg, UiCommand};
 use anyhow::{Context, Result};
@@ -202,24 +202,56 @@ pub fn parse_pending_updates(tsv: &str) -> Vec<String> {
         .collect()
 }
 
-/// Actualiza los juegos marcados, salvo los que están abiertos en ese momento.
+/// Actualiza los juegos con "Actualizar Automáticamente", salvo los que están abiertos.
 pub fn auto_update(cli: &Legendary, events: &Events) {
     let config = config::load();
     if config.offline_mode || config.auto_update.is_empty() {
         return;
     }
-    let pending = cli.games_with_updates();
+    let pending = cli.pending_updates();
+    update_if_wanted(cli, events, |app| config.auto_update.contains(app) && pending.iter().any(|p| p == app));
+}
+
+/// Lo que hace RootboundBackground: solo el último juego ejecutado, y solo si lo tiene marcado.
+pub fn update_last_played(cli: &Legendary, config: &config::Config, events: &Events) {
+    let Some(last) = last_played().filter(|id| config.auto_update.contains(id)) else {
+        return;
+    };
+    if config.offline_mode || !cli.refresh_pending_updates().contains(&last) {
+        return;
+    }
+    update_if_wanted(cli, events, |app| app == last);
+}
+
+fn update_if_wanted(cli: &Legendary, events: &Events, wanted: impl Fn(&str) -> bool) {
     let mut snapshot = ProcessSnapshot::new();
     snapshot.refresh();
     for game in cli.installed() {
-        let wanted = config.auto_update.contains(&game.app_name) && pending.contains(&game.app_name);
-        if wanted && !snapshot.folder_is_running(&game.install_path) {
+        if wanted(&game.app_name) && !snapshot.folder_is_running(&game.install_path) {
             events.log(LogMsg::AutoUpdating { title: game.title.clone() });
             let mut update: Vec<String> =
                 ["update", &game.app_name, "--skip-dlcs", "-y"].iter().map(|arg| arg.to_string()).collect();
             update.extend(selection_args(&game.install_tags));
-            cli.run(&update, events);
+            if cli.run(&update, events) {
+                cli.forget_update(&game.app_name);
+            }
         }
+    }
+}
+
+fn last_played_path() -> Option<PathBuf> {
+    Some(config::dir()?.join("last_played.txt"))
+}
+
+pub fn last_played() -> Option<String> {
+    let text = std::fs::read_to_string(last_played_path()?).ok()?;
+    Some(text.trim().to_string()).filter(|id| !id.is_empty())
+}
+
+pub fn remember_last_played(id: &str) {
+    if let Some(path) = last_played_path() {
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+        let _ = std::fs::write(path, id);
     }
 }
 
@@ -342,6 +374,9 @@ impl PlaytimeTracker {
         if running.is_empty() {
             return;
         }
+        if let Some(id) = running.first().filter(|id| last_played().as_deref() != Some(id.as_str())) {
+            remember_last_played(id);
+        }
         let mut playtime = load_playtime();
         for id in running {
             *playtime.entry(id.clone()).or_default() += elapsed;
@@ -398,7 +433,7 @@ pub struct ArtRequest {
     pub source: ArtSource,
 }
 
-#[derive(PartialEq, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum Section {
     #[default]
     All,
@@ -420,7 +455,7 @@ impl Section {
     }
 }
 
-#[derive(PartialEq, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum SortOrder {
     #[default]
     Ascending,
@@ -436,7 +471,40 @@ impl SortOrder {
     }
 }
 
-pub fn visible_games<'a>(
+/// Índices de los juegos a mostrar. Solo se recalcula si cambia la biblioteca, la
+/// búsqueda, el apartado o el orden: egui redibuja cada vez que se mueve el ratón.
+#[derive(Default)]
+pub struct VisibleCache {
+    key: Option<(u64, String, Section, SortOrder)>,
+    indices: Vec<usize>,
+}
+
+impl VisibleCache {
+    pub fn get(&mut self, games: &[GameInfo], version: u64, section: Section, query: &str, order: SortOrder) -> &[usize] {
+        let key = (version, query.to_string(), section, order);
+        if self.key.as_ref() != Some(&key) {
+            let needle = query.trim().to_lowercase();
+            let mut matches: Vec<(String, usize)> = games
+                .iter()
+                .enumerate()
+                .filter(|(_, game)| section.contains(game))
+                .map(|(index, game)| (game.title.to_lowercase(), index))
+                .filter(|(title, _)| title.contains(&needle))
+                .collect();
+            matches.sort();
+            if order == SortOrder::Descending {
+                matches.reverse();
+            }
+            self.indices = matches.into_iter().map(|(_, index)| index).collect();
+            self.key = Some(key);
+        }
+        &self.indices
+    }
+}
+
+/// Versión sin caché, usada por las pruebas para comprobar el filtro.
+#[cfg(test)]
+fn visible_games<'a>(
     games: &'a [GameInfo],
     section: Section,
     query: &str,
@@ -551,6 +619,7 @@ impl ExternalDraft {
 impl LauncherApp {
     pub(crate) fn rebuild_library(&mut self) {
         self.games = merge_library(&self.epic_games, &self.config.external_games);
+        self.library_version += 1;
         let requests: Vec<ArtRequest> = self
             .games
             .iter()
@@ -570,6 +639,7 @@ impl LauncherApp {
     }
 
     pub(crate) fn play(&mut self, game: &GameInfo) {
+        remember_last_played(&game.app_name);
         if let Some(previous) = self.running_game.take() {
             self.stop_game(&previous);
         }
@@ -724,17 +794,17 @@ impl ExternalRunner {
         let Ok(mut child) = command.spawn() else {
             return false;
         };
-        self.pids.lock().unwrap().insert(id.to_string(), child.id());
+        crate::process::lock(&self.pids).insert(id.to_string(), child.id());
         events.send(BackendEvent::GameStarted(id.to_string()));
         let _ = child.wait();
-        self.pids.lock().unwrap().remove(id);
+        crate::process::lock(&self.pids).remove(id);
         true
     }
 
     pub fn kill(&self, game: &ExternalGame) {
         match &game.kind {
             ExternalKind::Executable { .. } => {
-                if let Some(pid) = self.pids.lock().unwrap().remove(&game.id) {
+                if let Some(pid) = crate::process::lock(&self.pids).remove(&game.id) {
                     process::kill_tree(pid);
                 }
             }
@@ -854,7 +924,7 @@ pub fn cached_art(id: &str) -> Option<ArtSource> {
 
 fn cached_art_path(id: &str) -> Option<PathBuf> {
     let file_name: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
-    Some(legendary::install_dir()?.join("art").join(file_name))
+    Some(crate::paths::root().join("art").join(file_name))
 }
 
 fn art_bytes(request: &ArtRequest) -> Result<Vec<u8>> {
@@ -892,7 +962,7 @@ pub fn load_art(requests: Vec<ArtRequest>, events: &Events) {
     thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
-                let Some(request) = queue.lock().unwrap().next() else {
+                let Some(request) = crate::process::lock(&queue).next() else {
                     return;
                 };
                 if let Ok(image) = art_bytes(&request).and_then(|bytes| decode_art(&bytes, scale)) {
@@ -944,6 +1014,15 @@ mod tests {
         assert_eq!(titles(&missing), ["Alfa"]);
         let external = visible_games(&games, Section::External, "", SortOrder::Ascending);
         assert_eq!(titles(&external), ["osu"]);
+    }
+
+    #[test]
+    fn the_visible_cache_matches_the_filter_and_recomputes_on_changes() {
+        let games = [game("zeta", true, false), game("Alfa", false, false), game("osu", true, true)];
+        let mut cache = VisibleCache::default();
+        assert_eq!(cache.get(&games, 1, Section::All, "", SortOrder::Ascending), [1, 2, 0]);
+        assert_eq!(cache.get(&games, 1, Section::Installed, "", SortOrder::Descending), [0, 2]);
+        assert_eq!(cache.get(&games, 1, Section::All, "ALF", SortOrder::Ascending), [1]);
     }
 
     #[test]

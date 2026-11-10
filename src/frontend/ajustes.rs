@@ -48,6 +48,11 @@ pub(super) fn render(app: &mut LauncherApp, ui: &mut egui::Ui) {
             }
         });
         section(ui, app.t("updates"), None, |ui| updates(app, ui));
+        section(ui, "C:\\Rootbound", None, |ui| {
+            if filled_button(ui, app.t("file_folder"), DARK_CYAN) {
+                app.send(UiCommand::OpenRootFolder);
+            }
+        });
         section(ui, app.t("factory_reset"), Some(Color32::from_rgb(220, 80, 80)), |ui| {
             ui.label(RichText::new(app.t("factory_reset_desc")).color(Color32::GRAY));
             ui.add_space(10.0);

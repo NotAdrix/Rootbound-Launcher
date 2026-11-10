@@ -6,10 +6,13 @@ mod drivers;
 mod frontend;
 mod i18n;
 mod import;
+mod installer;
 mod juegos;
 mod legendary;
 mod login;
+mod paths;
 mod process;
+mod tray;
 mod service;
 mod types;
 mod updater;
@@ -39,15 +42,22 @@ fn window_icon() -> egui::IconData {
 
 fn main() -> Result<(), eframe::Error> {
     updater::remove_previous_version();
-    if std::env::args().any(|arg| arg == service::BACKGROUND_FLAG) {
+    if std::env::args().any(|arg| arg == drivers::ELEVATED_FLAG) {
+        drivers::clean_drivers_elevated();
+        return Ok(());
+    }
+    if service::is_background_process() {
         service::run();
+        return Ok(());
+    }
+    if installer::ensure_installed() {
         return Ok(());
     }
     let Some(_gui_lock) = service::hold_gui_lock() else {
         service::focus_existing_window();
         return Ok(());
     };
-    std::thread::spawn(service::install_and_start);
+    std::thread::spawn(service::sync);
     let config = config::load();
 
     let options = eframe::NativeOptions {

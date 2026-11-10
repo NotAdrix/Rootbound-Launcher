@@ -60,6 +60,10 @@ pub fn t(lang: Language, key: &str) -> &'static str {
         ),
         "use_with_care" => ("Utilice la herramienta con precaución.", "Use this tool with caution."),
         "open_nvcleanstall" => ("Abrir NVCleanstall", "Open NVCleanstall"),
+        "file_folder" => ("File Folder", "File Folder"),
+        "disable_tracking" => ("Deshabilitar trackeo", "Disable tracking"),
+        "enable_tracking" => ("Habilitar trackeo", "Enable tracking"),
+        "tracking_off_note" => ("El trackeo está deshabilitado: no se registra tiempo nuevo.", "Tracking is disabled: no new time is recorded."),
         "all_games" => ("Todos", "All"),
         "automatic" => ("Automático", "Automatic"),
         "no_language_packs" => (
@@ -195,6 +199,8 @@ pub fn render_log(lang: Language, msg: &LogMsg) -> String {
         }
         LogMsg::DriversDownloading => ("Descargando DDU y preparando el proceso...", "Downloading DDU and preparing..."),
         LogMsg::NvcleanstallDownloading => ("Descargando NVCleanstall...", "Downloading NVCleanstall..."),
+        LogMsg::DriversElevating => ("Pidiendo permiso de administrador para preparar el modo seguro...", "Requesting administrator permission to prepare safe mode..."),
+        LogMsg::DriversFailed(DriversFailure::Cancelled) => ("[AVISO] No se concedió el permiso de administrador. No se cambió nada.", "[WARNING] Administrator permission was not granted. Nothing was changed."),
         LogMsg::DriversRestarting => ("Todo listo. El PC se reiniciará en 10 segundos.", "All set. The PC will restart in 10 seconds."),
         LogMsg::DriversFailed(DriversFailure::BitLocker) => ("[ERROR] No se puede continuar con BitLocker activo. No se cambió nada.", "[ERROR] Cannot continue with BitLocker enabled. Nothing was changed."),
         LogMsg::DriversFailed(DriversFailure::Prepare) => ("[ERROR] No se pudo preparar el proceso. El arranque no se modificó.", "[ERROR] The process could not be prepared. Boot settings were not changed."),
@@ -202,6 +208,8 @@ pub fn render_log(lang: Language, msg: &LogMsg) -> String {
         LogMsg::DriversFailed(DriversFailure::InvalidHash) => ("[ERROR] El archivo descargado no coincide con el publicado y se descartó. No se cambió nada.", "[ERROR] The downloaded file does not match the published one and was discarded. Nothing was changed."),
         LogMsg::DriversFailed(DriversFailure::Install) => ("[ERROR] No se pudo instalar DDU. No se cambió nada.", "[ERROR] DDU could not be installed. Nothing was changed."),
         LogMsg::DriversFailed(DriversFailure::Boot) => ("[ERROR] No se pudo preparar el modo seguro. No se reiniciará.", "[ERROR] Safe mode could not be prepared. The PC will not restart."),
+        LogMsg::ElevatingGame => ("El juego está en una carpeta protegida; pidiendo permiso de administrador...", "The game is in a protected folder; requesting administrator permission..."),
+        LogMsg::ElevationDenied => ("[AVISO] No se concedió el permiso de administrador.", "[WARNING] Administrator permission was not granted."),
         LogMsg::CommandFailed => ("[ERROR] La operación de Legendary no terminó correctamente.", "[ERROR] The Legendary operation did not finish correctly."),
         LogMsg::AlreadyUpToDate => ("Juego listo para ejecutar.", "Game ready to launch."),
         LogMsg::InstallFinished => ("Instalación finalizada.", "Installation finished."),

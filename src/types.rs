@@ -11,6 +11,7 @@ pub enum Language {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DriversFailure {
+    Cancelled,
     BitLocker,
     Prepare,
     Download,
@@ -52,7 +53,10 @@ pub enum LogMsg {
     LegendaryUnavailable,
     CommandCouldNotStart,
     CommandFailed,
+    ElevatingGame,
+    ElevationDenied,
     DriversDownloading,
+    DriversElevating,
     NvcleanstallDownloading,
     DriversRestarting,
     DriversFailed(DriversFailure),
@@ -138,6 +142,7 @@ pub enum UiCommand {
     LoadProfile,
     SetOfflineMode(bool),
     RemoveBrowser,
+    OpenRootFolder,
     CleanDrivers,
     OpenNvcleanstall,
     RepairGhost { app_name: String, path: String },

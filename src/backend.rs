@@ -1,9 +1,10 @@
 use crate::juegos::logica::{self, ExternalRunner};
-use crate::legendary::{self, ImportOutcome, Legendary};
+use crate::legendary::{ImportOutcome, Legendary};
 use crate::types::{BackendEvent, Events, LogMsg, LoginFailure, UiCommand};
-use crate::{config, drivers, import, login, process, service, updater};
+use crate::{drivers, import, login, process, service, updater};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -14,7 +15,7 @@ enum Job {
     Startup,
     AutoUpdate,
     UpdateLegendary,
-    Run { args: Vec<String>, reload: bool },
+    Run { args: Vec<String>, reload: bool, elevate: Option<PathBuf> },
     Uninstall(String),
     DeleteGhost(String),
     InstallDlcs(Vec<String>),
@@ -53,14 +54,14 @@ pub fn start(commands: Receiver<UiCommand>, events: Events) {
             thread::sleep(AUTO_UPDATE_INTERVAL);
             let _ = timer_jobs.send(Job::AutoUpdate);
         });
-        let worker = (cli.clone(), events.clone(), jobs.clone());
+        let worker = (cli.clone(), events.clone());
         thread::spawn(move || {
-            let (cli, events, jobs) = worker;
+            let (cli, events) = worker;
             for job in job_queue {
                 if !cli.is_shutting_down() {
                     events.log(LogMsg::Separator);
                     events.send(BackendEvent::JobStarted);
-                    run_job(job, &cli, &events, &jobs);
+                    run_job(job, &cli, &events);
                     events.send(BackendEvent::JobFinished);
                 }
             }
@@ -132,15 +133,24 @@ fn handle_command(
                 process::kill_game(&root);
             }
         }),
+        // Solo al recargar se buscan juegos nuevos en el disco: es lo más lento.
         UiCommand::ReloadLibrary => {
-            in_background(cli, events, |cli, events| reload(&cli, &events))
+            let jobs = jobs.clone();
+            in_background(cli, events, move |cli, events| {
+                reload(&cli, &events);
+                cli.refresh_pending_updates();
+                events.log(LogMsg::SearchingNewGames);
+                events.send(BackendEvent::JobStarted);
+                let _ = jobs.send(Job::Import(import::find_epic_games()));
+                events.send(BackendEvent::JobFinished);
+            });
         }
         UiCommand::InstallGame { app_name, path, dlcs } => {
             let mut install = args(&["install", &app_name, "--base-path", &path, "--skip-sdl", "-y"]);
             if !dlcs {
                 install.push("--skip-dlcs".into());
             }
-            queue(Job::Run { args: install, reload: true });
+            queue(Job::Run { args: install, reload: true, elevate: Some(PathBuf::from(path)) });
         }
         UiCommand::UninstallGame(app_name) => queue(Job::Uninstall(app_name)),
         UiCommand::ListDlcs(app_name) => in_background(cli, events, move |cli, events| {
@@ -162,24 +172,8 @@ fn handle_command(
         UiCommand::PerformUpdate(url) => {
             in_background(cli, events, move |_, events| updater::perform(&url, &events))
         }
-        UiCommand::PauseDownload => {
-            if let Some(interrupted) = cli.stop() {
-                *paused = Some(interrupted);
-                events.log(LogMsg::PausingDownload);
-                events.send(BackendEvent::DownloadPaused);
-            }
-        }
-        UiCommand::ResumeDownload => {
-            if let Some(interrupted) = paused.take() {
-                events.log(LogMsg::ResumingDownload);
-                queue(Job::Run { args: interrupted, reload: true });
-            }
-        }
-        UiCommand::CancelDownload => {
-            cli.stop();
-            *paused = None;
-            events.log(LogMsg::DownloadCancelled);
-            events.send(BackendEvent::DownloadCancelled);
+        UiCommand::PauseDownload | UiCommand::ResumeDownload | UiCommand::CancelDownload => {
+            control_download(&command, cli, events, jobs, paused)
         }
         UiCommand::FactoryReset => {
             in_background(cli, events, |cli, events| factory_reset(&cli, &events))
@@ -193,7 +187,7 @@ fn handle_command(
                 "install", &app_name, "--base-path", &parent, "--game-folder", &name,
                 "--skip-sdl", "--skip-dlcs", "-y",
             ]);
-            queue(Job::Run { args: install, reload: true });
+            queue(Job::Run { args: install, reload: true, elevate: Some(PathBuf::from(parent)) });
         }
         UiCommand::DeleteGhost { path } => queue(Job::DeleteGhost(path)),
         UiCommand::CleanDrivers => in_background(cli, events, |_, events| {
@@ -206,17 +200,46 @@ fn handle_command(
             drivers::open_nvcleanstall(&events);
             events.send(BackendEvent::JobFinished);
         }),
+        UiCommand::OpenRootFolder => {
+            let _ = std::process::Command::new("explorer").arg(crate::paths::root()).spawn();
+        }
         UiCommand::RemoveBrowser => in_background(cli, events, |_, _| login::uninstall_chrome()),
         UiCommand::LoadProfile => in_background(cli, events, |cli, events| {
             events.send(BackendEvent::ProfileLoaded(cli.profile()));
         }),
         UiCommand::SetOfflineMode(offline) => cli.set_offline(offline),
-        UiCommand::RemoveApp => in_background(cli, events, |cli, events| {
-            service::unregister();
-            updater::delete_own_exe_after_exit();
-            factory_reset(&cli, &events);
-        }),
+        UiCommand::RemoveApp => in_background(cli, events, |cli, events| remove_app(&cli, &events)),
         UiCommand::LaunchExternal(_) | UiCommand::KillExternal(_) | UiCommand::LoadArt(_) => {}
+    }
+}
+
+fn control_download(
+    command: &UiCommand,
+    cli: &Legendary,
+    events: &Events,
+    jobs: &Sender<Job>,
+    paused: &mut Option<Vec<String>>,
+) {
+    match command {
+        UiCommand::PauseDownload => {
+            if let Some(interrupted) = cli.stop() {
+                *paused = Some(interrupted);
+                events.log(LogMsg::PausingDownload);
+                events.send(BackendEvent::DownloadPaused);
+            }
+        }
+        UiCommand::ResumeDownload => {
+            if let Some(interrupted) = paused.take() {
+                events.log(LogMsg::ResumingDownload);
+                let _ = jobs.send(Job::Run { args: interrupted, reload: true, elevate: None });
+            }
+        }
+        _ => {
+            cli.stop();
+            *paused = None;
+            events.log(LogMsg::DownloadCancelled);
+            events.send(BackendEvent::DownloadCancelled);
+        }
     }
 }
 
@@ -224,16 +247,16 @@ fn reload(cli: &Legendary, events: &Events) {
     events.send(BackendEvent::LibraryLoaded(cli.library()));
 }
 
-fn run_job(job: Job, cli: &Legendary, events: &Events, jobs: &Sender<Job>) {
+fn run_job(job: Job, cli: &Legendary, events: &Events) {
     match job {
-        Job::Startup => startup(cli, events, jobs),
+        Job::Startup => startup(cli, events),
         Job::AutoUpdate => logica::auto_update(cli, events),
         Job::UpdateLegendary => match cli.replace_with_latest() {
             Ok(()) => events.log(LogMsg::LegendaryUpdated),
             Err(_) => events.log(LogMsg::LegendaryUpdateFailed),
         },
-        Job::Run { args, reload: should_reload } => {
-            let completed = cli.run(&args, events);
+        Job::Run { args, reload: should_reload, elevate } => {
+            let completed = cli.run_in(&args, elevate.as_deref(), events);
             if completed && args.first().is_some_and(|command| command == "install") {
                 if let Some(app_name) = args.get(1) {
                     events.send(BackendEvent::InstallFinished(app_name.clone()));
@@ -248,7 +271,7 @@ fn run_job(job: Job, cli: &Legendary, events: &Events, jobs: &Sender<Job>) {
             if let Some(root) = &root {
                 process::kill_game(root);
             }
-            cli.run(&args(&["uninstall", &app_name, "-y"]), events);
+            cli.run_in(&args(&["uninstall", &app_name, "-y"]), root.as_deref(), events);
             let leftover = root.filter(|_| cli.install_path(&app_name).is_none());
             if let Some(root) = leftover.filter(|root| !process::remove_leftover_folder(root)) {
                 events.log(LogMsg::FolderNotRemoved { path: root.display().to_string() });
@@ -285,12 +308,14 @@ fn run_job(job: Job, cli: &Legendary, events: &Events, jobs: &Sender<Job>) {
             }
             let mut update = args(&["update", &app_name, "--skip-dlcs", "-y"]);
             update.extend(cli.selection_args(&app_name));
-            cli.run(&update, events);
+            if cli.run_in(&update, cli.install_path(&app_name).as_deref(), events) {
+                cli.forget_update(&app_name);
+            }
         }
         Job::Repair(app_name) => {
             let mut repair = args(&["repair", &app_name, "--skip-dlcs", "-y"]);
             repair.extend(cli.selection_args(&app_name));
-            cli.run(&repair, events);
+            cli.run_in(&repair, cli.install_path(&app_name).as_deref(), events);
         }
         Job::InstallLanguage { app_name, tag } => {
             // `repair` porque con la misma versión del juego `install` no baja nada nuevo.
@@ -299,17 +324,17 @@ fn run_job(job: Job, cli: &Legendary, events: &Events, jobs: &Sender<Job>) {
                 repair.push("--install-tag".to_string());
                 repair.push(tag);
             }
-            cli.run(&repair, events);
+            cli.run_in(&repair, cli.install_path(&app_name).as_deref(), events);
         }
-        Job::Import(games) => {
-            import_games(games, cli, events);
-            check_for_updates(cli, events);
-            logica::auto_update(cli, events);
-        }
+        Job::Import(games) => import_games(games, cli, events),
         Job::Launch { app_name, language } => {
             let mut update = args(&["update", &app_name, "--skip-dlcs", "-y"]);
             update.extend(cli.selection_args(&app_name));
-            if !cli.has_update(&app_name) || cli.run(&update, events) {
+            let needs_update = cli.has_update(&app_name);
+            if !needs_update || cli.run_in(&update, cli.install_path(&app_name).as_deref(), events) {
+                if needs_update {
+                    cli.forget_update(&app_name);
+                }
                 in_background(cli, events, move |cli, events| {
                     start_game(&cli, &app_name, language.as_deref(), &events)
                 });
@@ -352,7 +377,7 @@ fn log_in(cli: &Legendary, events: &Events) {
     }
 }
 
-fn startup(cli: &Legendary, events: &Events, jobs: &Sender<Job>) {
+fn startup(cli: &Legendary, events: &Events) {
     if cli.is_offline() {
         events.log(LogMsg::LoadingLocalLibrary);
         reload(cli, events);
@@ -367,14 +392,10 @@ fn startup(cli: &Legendary, events: &Events, jobs: &Sender<Job>) {
     events.log(LogMsg::LoadingLocalLibrary);
     events.send(BackendEvent::LibraryLoaded(games));
 
-    // Recorrer los discos puede tardar: no debe retener la cola de tareas.
-    events.log(LogMsg::SearchingNewGames);
-    let (jobs, scan_events) = (jobs.clone(), events.clone());
-    thread::spawn(move || {
-        scan_events.send(BackendEvent::JobStarted);
-        let _ = jobs.send(Job::Import(import::find_epic_games()));
-        scan_events.send(BackendEvent::JobFinished);
-    });
+    // Una sola consulta al arrancar: después, "Iniciar" no espera a Epic.
+    cli.refresh_pending_updates();
+    check_for_updates(cli, events);
+    logica::auto_update(cli, events);
 }
 
 fn import_games(found: Vec<(String, String)>, cli: &Legendary, events: &Events) {
@@ -435,17 +456,21 @@ fn factory_reset(cli: &Legendary, events: &Events) {
     cli.begin_shutdown();
     service::stop();
 
-    if let Some(home) = dirs::home_dir() {
-        let _ = std::fs::remove_dir_all(home.join(".config").join("legendary"));
+    // Se conservan los programas y los juegos instalados.
+    let root = crate::paths::root();
+    for folder in ["config", "legendary", "art", "drivers"] {
+        let _ = std::fs::remove_dir_all(root.join(folder));
     }
-    if let Some(dir) = config::dir() {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    let _ = std::fs::remove_file(root.join("legendary.exe"));
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("rootbound_launcher_profile"));
-
-    if let Some(dir) = legendary::install_dir() {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     thread::sleep(Duration::from_secs(2));
     events.send(BackendEvent::ResetComplete);
+}
+
+/// Borra todo `C:\Rootbound` salvo los juegos. El propio launcher se borra al cerrarse.
+fn remove_app(cli: &Legendary, events: &Events) {
+    service::unregister();
+    factory_reset(cli, events);
+    let _ = std::fs::remove_file(crate::paths::background_exe());
+    updater::delete_own_exe_after_exit();
 }
